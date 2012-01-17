@@ -2,7 +2,7 @@
 #include "tools.h"
 
 
-#define RESET_AFTER_TIME 100    // (in 100 milliseconds)
+#define RESET_AFTER_TIME 200    // (in 100 milliseconds)
 #define RESET_DURATION 20 		// (in 100 milliseconds)
 
 
