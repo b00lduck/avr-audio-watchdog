@@ -106,7 +106,7 @@ int main() {
 	TCCR1B |= (1<<WGM12) | (1<<CS10) | (1<<CS12);
 	TCNT1 = 0;
 	OCR1A = 2000; // 100ms
-	OCR1A = 1000; // 50ms
+	//OCR1A = 1000; // 50ms
 	//OCR1A = 10000; // 500ms
 	TIMSK1 |= (1<<OCIE1A);
 
