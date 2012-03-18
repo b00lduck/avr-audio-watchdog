@@ -1,106 +1,208 @@
 #include "stdinc.h"
 #include "tools.h"
 
+#define RESET_AFTER_TIME 		40  // (in 100 milliseconds * NUMCHANNELS)
+#define RESET_DURATION 			5 	// (in 100 milliseconds * NUMCHANNELS)
+#define REBOOT_DURATION 		40 	// (in 100 milliseconds * NUMCHANNELS)
+#define REBOOT_GIVEUP_THRESH 	3	// give up after x reboots
 
-#define RESET_AFTER_TIME 200    // (in 100 milliseconds)
-#define RESET_DURATION 20 		// (in 100 milliseconds)
+#define NUMLEDSPERCHANNEL 4
+#define NUMCHANNELS 8
+#define NUMLEDS (NUMCHANNELS*NUMLEDSPERCHANNEL)
 
-
-#define NUMLEDS 6
-
-#define NUMCHANNELS 2
-#define MUXADDRESSMASK 0b00000011
+#define MUXADDRESSMASK 0b00000111
 
 struct {
+	
+	unsigned char enabled;
 
-//	char enabled;
-//	char relais;
-	char signal;
-	char signal_loss;
-//	char resetted;
+	unsigned char relais;
+	unsigned char signal;
+	unsigned int signal_loss_counter;
+	int is_resetting;
+	int is_rebooting;
+	unsigned int reboot_counter;
 
-} channelstate[8];
+} channelstate[NUMCHANNELS];
 
-
-
+char blink = 0;
 char active_channel = 0;
+char error_flag = 0;
 
-
-// display
+// Display memory
 char display[NUMLEDS];
 
+// dipswitch memory representation
+char enabled[NUMCHANNELS];
 
 
 /**
-char relais = 0;
-char power = 1;
-char signal = 0;
-char signal_loss = 0;
-*/
+ * display driver
+ * sends commands to the 595 cascade
+ * first 4 bits of each 595 are low active, high 4 bits high active
+ * because of the maximum current for vcc and gnd lines of the 595
+ */
+void updateDisplay() {
 
-char error_flag = 0;
+	unsigned char i;
+	for (i=0;i<NUMLEDS;i++) {
 
+		char bit = display[(NUMLEDS-1)-i];
 
-// status
-uint16_t signal_loss_time = 0;
-uint16_t reset_timer = 0;
+		// invert first 4 bits of each 595
+		if ((i%8)>3) {
+			if (bit) {
+				bit = 0;
+			} else {
+			    bit = 1;
+			}
+		}
 
-void ADC_init(void) {
- 
-  uint16_t result;
- 
-  ADMUX = (1<<REFS0) | (1<<REFS1);      // VC2,5V
-  // Bit ADFR ("free running") in ADCSRA steht beim Einschalten
-  // schon auf 0, also single conversion
-  ADCSRA = (1<<ADPS1) | (1<<ADPS0);     // Frequenzvorteiler
-  ADCSRA |= (1<<ADEN);                  // ADC aktivieren
- 
-  /* nach Aktivieren des ADC wird ein "Dummy-Readout" empfohlen, man liest
-     also einen Wert und verwirft diesen, um den ADC "warmlaufen zu lassen" */
-  ADCSRA |= (1<<ADSC);                  // eine ADC-Wandlung 
-  while (ADCSRA & (1<<ADSC) ) {}        // auf Abschluss der Konvertierung warten
-  /* ADCW muss einmal gelesen werden, sonst wird Ergebnis der nächsten
-     Wandlung nicht übernommen. */
-  result = ADCW;
+		// set bit
+		if (bit == 1) {
+			SBI(PORTB,0);
+		} else {
+			CBI(PORTB,0);
+		}
+
+		// NEXT BIT
+		SBI(PORTB,1);
+		CBI(PORTB,1);
+
+	}
+
+	// LATCH IT
+	SBI(PORTB,2);
+	CBI(PORTB,2);
+	
 }
- 
-/* ADC Einzelmessung */
-uint16_t ADC_Read( uint8_t channel ) {
-  // Kanal waehlen, ohne andere Bits zu beeinflußen
-  ADMUX = (ADMUX & ~(0x1F)) | (channel & 0x1F);
-  ADCSRA |= (1<<ADSC);            // eine Wandlung "single conversion"
-  while (ADCSRA & (1<<ADSC) ) {}  // auf Abschluss der Konvertierung warten
-  return ADCW;                    // ADC auslesen und zurückgeben
+
+/**
+ * reads dipswitch and stores its value into enabled[] array
+ */
+void updateRelais() {
+
+	unsigned char i;
+	for (i=0;i<NUMCHANNELS;i++) {
+
+		if (channelstate[i].relais == 1) {
+			SBI(PORTC,i);
+		} else {
+			CBI(PORTC,i);
+		}
+
+	}
+
 }
- 
-/* ADC Mehrfachmessung mit Mittelwertbbildung */
-uint16_t ADC_Read_Avg( uint8_t channel, uint8_t average ) {
-  uint32_t result = 0;
- 
-  for (uint8_t i = 0; i < average; ++i ) {
-    result += ADC_Read( channel );
-  }
- 
-  return (uint16_t)( result / average );
+
+/**
+ * reads dipswitch and stores its value into enabled[] array
+ */
+void updateDipswitch() {
+
+	unsigned char i;
+	for (i=0;i<NUMCHANNELS;i++) {
+
+		enabled[(NUMCHANNELS-1)-i] = !PIN(PIND,i);	
+
+	}
+
 }
- 
+
+
+/**
+ * writes to the display memory
+ */
+void setDisplay() {
+
+	unsigned char i;
+	for (i=0;i<NUMCHANNELS;i++) {
+
+		char red = 0;
+		char yellow = 0;
+		char green1 = 0;
+		char green2 = enabled[i];
+
+ 		if(enabled[i]) {
+
+			// RED (ON=HAD RESET, BLINK=CHANNEL HAS GIVEN UP)
+			if (channelstate[i].reboot_counter >= REBOOT_GIVEUP_THRESH) {
+				red = blink;         		
+			}
+
+			// YELLOW (BLINK=RELAIS ENGAGED, ON=REBOOT IN PROGRESS)
+			if (channelstate[i].relais > 0) {				
+				yellow = blink;
+			} else if (channelstate[i].is_rebooting > 0) {
+				yellow = 1;
+			}         		
+		
+			// GREEN 1 (SIGNAL / MEASURING)
+			if (i == active_channel) {
+				if ((channelstate[i].reboot_counter < REBOOT_GIVEUP_THRESH) && (channelstate[i].is_rebooting == 0)) {
+					green1 = 1;          	
+				}
+			} else {
+				green1 = channelstate[i].signal;	
+			}
+
+		}
+
+
+		// RED
+		display[i*NUMLEDSPERCHANNEL+0] = red;
+
+		// YELLOW
+		display[i*NUMLEDSPERCHANNEL+1] = yellow;
+
+		// GREEN 1
+		display[i*NUMLEDSPERCHANNEL+2] = green1;
+		
+		// GREEN 2 (ENABLED)
+		display[i*NUMLEDSPERCHANNEL+3] = green2;
+
+	}
+
+}
+
+
+void reset() {
+	memset(display,0,NUMLEDS);
+	memset(enabled,0,NUMCHANNELS);
+	memset(channelstate,0,NUMCHANNELS * sizeof(channelstate));
+}
+
+void checkReset() {
+	if (((PINA & 0b00010000) >> 4) == 1) {
+		// no reset
+	} else {
+		reset();
+	}
+}
 
 
 int main() {
 
-	// LEDs	
-	DDRC = 0b00111111;
-	PORTC = 0b00001000;
+	// ADRESS OUTPUT FOR MULTIPLEXER: Bits 0,1,2
+	// ANALOG INPUT: Bit 3
+	// RESET SWITCH: Bit 4
+	DDRA =  0b00000111;
+	PORTA = 0b00010000;
 
-	// RESET BUTTON
-	DDRD = 0b00000100;
-	PORTD = 0b00000100;
-	EIMSK |= (1<<INT0);
+	// 595s
+	// 0: SER
+	// 1: /SCK
+	// 2: /RCK
+	DDRB = 0b00001111;
+	PORTB = 0b00000000;
 
-	// ADRESS OUTPUT FOR MULTIPLEXER
-	DDRA = 0b00000011;
-	PORTA = 0b00000000;
+	// RELAIS
+	DDRC = 0b11111111;
+	PORTC = 0b00000000;
 
+	// DIPSWITCH
+	DDRD = 0b00000000;
+	PORTD = 0b11111111;
 
 	// TIMER1 (Naechste messung)		
 	TCCR1B |= (1<<WGM12) | (1<<CS10) | (1<<CS12);
@@ -110,73 +212,109 @@ int main() {
 	//OCR1A = 10000; // 500ms
 	TIMSK1 |= (1<<OCIE1A);
 
-
-	// reset LEDs
-	char i;
-	for (i=0;i<NUMLEDS;i++) {
-		display[i] = 0;
-	}
+	reset();
 
 	ADC_init();
 
 	sei();
 
 	while(1) {
-  
-		char data = 0;
 
-		char i;
-		char mask = 1;
+  		updateDipswitch();
+	
+		updateRelais();
+
+		setDisplay();
 		
-		for (i=0;i<NUMLEDS;i++) {
-			data += display[i] * mask;
-			mask <<= 1;
-		}
-		
-		PORTC = data;
+  		updateDisplay();
+
+		checkReset();
 
 	}
 
 
 }
 
+/*
 ISR (INT0_vect) {
 
 	error_flag = 0;
 
 }
+*/
 
 ISR (TIMER1_COMPA_vect) {
 
-	display[0] = active_channel & 1;
-	display[1] = (active_channel & 2) >> 1;
-	
+	blink ^= 1;
 
 	uint16_t adcval;
 
-	adcval = ADC_Read_Avg(7, 1);  // Kanal 7, Mittelwert aus 4 Messungen
+	adcval = ADC_Read_Avg(3, 1);  // Kanal 7, Mittelwert aus 1 Messungen
 
-	if (adcval < 20) {
-		channelstate[active_channel].signal_loss = 1;
-		if (active_channel == 0) {
-			display[2] = 1;
-		}
-		if (active_channel == 1) {
-			display[4] = 1;
+	if (enabled[active_channel]) {
+		
+		// CHANNEL IS ENABLED
+
+		if (channelstate[active_channel].reboot_counter >= REBOOT_GIVEUP_THRESH) {
+
+			// TOO MANY REBOOTS, GIVE UP
+
+			channelstate[active_channel].relais = 0;
+			channelstate[active_channel].is_rebooting = 0;
+			channelstate[active_channel].is_resetting = 0;
+			channelstate[active_channel].signal_loss_counter = 0;
+			channelstate[active_channel].signal = 0;	
+
+		} else {
+
+			if ((channelstate[active_channel].is_resetting <= 0) && (channelstate[active_channel].is_rebooting <= 0)) {
+
+				// SWITCH RELAIS OFF if channel is not resetting or rebooting
+				channelstate[active_channel].relais = 0;
+			
+				// detect signal
+				if (adcval < 20) {
+					// SIGNAL LOSS
+					channelstate[active_channel].signal = 0;
+					channelstate[active_channel].signal_loss_counter++;
+				} else {
+					// SIGNAL DETECTED
+					channelstate[active_channel].signal = 1;
+					channelstate[active_channel].signal_loss_counter = 0;
+				}
+
+				// if signal is lost for amount of RESET_AFTER_TIME trigger reboot
+				if (channelstate[active_channel].signal_loss_counter > RESET_AFTER_TIME) {
+					channelstate[active_channel].is_resetting = RESET_DURATION;
+					channelstate[active_channel].is_rebooting = REBOOT_DURATION;
+					channelstate[active_channel].signal_loss_counter = 0;
+					channelstate[active_channel].reboot_counter++;				
+				}
+
+			}
+	
+			if (channelstate[active_channel].is_resetting > 0) {
+				channelstate[active_channel].relais = 1;				
+				channelstate[active_channel].is_resetting--;
+			} else if (channelstate[active_channel].is_rebooting > 0) {
+				channelstate[active_channel].relais = 0;				
+				channelstate[active_channel].is_rebooting--;		
+			}
 		}
 
 	} else {
-		channelstate[active_channel].signal_loss = 0;
 
-		if (active_channel == 0) {
-			display[2] = 0;
-		}
-		if (active_channel == 1) {
-			display[4] = 0;
-		}
+		// CHANNEL IS DISABLED
+
+		channelstate[active_channel].relais = 0;
+		channelstate[active_channel].is_rebooting = 0;
+		channelstate[active_channel].is_resetting = 0;
+		channelstate[active_channel].signal_loss_counter = 0;
+		channelstate[active_channel].signal = 0;
+		channelstate[active_channel].reboot_counter = 0;
 
 	}
-
+		
 
 	active_channel++;
 
@@ -184,38 +322,7 @@ ISR (TIMER1_COMPA_vect) {
 		active_channel = 0;
 	}
 
-	PORTA = active_channel & MUXADDRESSMASK;
-
-
-
-/*
-	uint16_t adcval;
-
-	adcval = ADC_Read_Avg(7, 4);  // Kanal 7, Mittelwert aus 4 Messungen
-
-	if (adcval < 500) {
-		signal_loss = 1;
-		signal = 0;
-		signal_loss_time += 1;
-	} else {
-		signal_loss = 0;
-		signal = 1;
-		signal_loss_time = 0;
-	}
-
-	if (signal_loss_time > (RESET_AFTER_TIME)) {
-		error_flag = 1;
-		reset_timer = RESET_DURATION;
-		signal_loss_time = 0;
-	}
-
-	if (reset_timer > 0) {
-		relais = 1;
-		reset_timer--;
-	} else {
-		relais = 0;
-	}
-
-*/
+	// keep pullup active for reset switch
+	PORTA = 0b00010000 | (MUXADDRESSMASK & active_channel);
 
 }

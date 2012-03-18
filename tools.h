@@ -5,6 +5,7 @@ void delay_long (uint8_t count);
 
 #define SBI(port,bit) port |= (1<<bit)
 #define CBI(port,bit) port &= ~(1<<bit)
+#define PIN(pin,bit) ((pin & (1<<bit)) >> bit)
 
 
 
